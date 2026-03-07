@@ -2923,6 +2923,31 @@ elif page == "Manage Sources":
                     f'</div></div>',
                     unsafe_allow_html=True)
 
+    # --- Data Export Section ---
+    st.markdown("---")
+    st.markdown(
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">'
+        '<span style="font-size:1.1rem">&#x1f4e5;</span>'
+        '<span style="font-size:1rem;font-weight:700;color:#0F172A">Data Export / Backup</span></div>',
+        unsafe_allow_html=True)
+    st.caption("Download a full backup of all your finance data as an Excel file with one sheet per table.")
+    if st.button("Download Full Backup (.xlsx)", type="primary", key="export_btn"):
+        import io
+        all_data = db.export_all_data()
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            for table_name, rows in all_data.items():
+                df = pd.DataFrame(rows) if rows else pd.DataFrame()
+                df.to_excel(writer, sheet_name=table_name[:31], index=False)
+        buf.seek(0)
+        st.download_button(
+            label="Click to Save",
+            data=buf.getvalue(),
+            file_name=f"finance_backup_{date.today().isoformat()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_xlsx",
+        )
+
 
 # ===========================
 # HISTORY & ANALYTICS PAGE

@@ -909,3 +909,19 @@ def update_sip_value_update(update_id, current_value, total_invested=None,
     if note is not None:
         updates["note"] = note
     _sb().table("sip_value_updates").update(updates).eq("id", update_id).execute()
+
+
+def export_all_data():
+    """Export all tables as a dict of table_name -> list of dicts."""
+    tables = [
+        "sources", "balance_updates", "gold_rates", "gold_purchases",
+        "stock_holdings", "stock_value_updates", "stock_sells",
+        "exchange_rates", "policies", "loans", "loan_payments",
+        "gold_schemes", "gold_scheme_payments", "sips", "sip_payments",
+        "sip_value_updates",
+    ]
+    data = {}
+    for t in tables:
+        rows = _sb().table(t).select("*").execute().data
+        data[t] = rows
+    return data
