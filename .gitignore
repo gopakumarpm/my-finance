@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+finance_tracker.db
+database_sqlite.py
+migrate_to_supabase.py
+*.db-journal
+.DS_Store
