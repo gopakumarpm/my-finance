@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, datetime, timedelta
 import hashlib
+import time
 import database as db
 import gold_rate as gr
 import stock_price as sp
@@ -55,14 +56,35 @@ def _show_login():
             label_visibility="collapsed",
         )
 
-        if st.button("Unlock", type="primary", use_container_width=True):
+        # --- Lockout logic ---
+        max_attempts = 5
+        lockout_seconds = 900  # 15 minutes
+        if "login_attempts" not in st.session_state:
+            st.session_state["login_attempts"] = 0
+        if "lockout_until" not in st.session_state:
+            st.session_state["lockout_until"] = 0
+
+        locked = st.session_state["lockout_until"] > time.time()
+        if locked:
+            remaining = int(st.session_state["lockout_until"] - time.time())
+            mins, secs = divmod(remaining, 60)
+            st.error(f"Too many failed attempts. Try again in {mins}m {secs}s.")
+        elif st.button("Unlock", type="primary", use_container_width=True):
             if not pin or len(pin) != 4 or not pin.isdigit():
                 st.error("Please enter a 4-digit PIN")
             elif _hash_pin(pin) == st.secrets.get("PIN_HASH", ""):
                 st.session_state["authenticated"] = True
+                st.session_state["login_attempts"] = 0
                 st.rerun()
             else:
-                st.error("Incorrect PIN. Try again.")
+                st.session_state["login_attempts"] += 1
+                remaining_tries = max_attempts - st.session_state["login_attempts"]
+                if remaining_tries <= 0:
+                    st.session_state["lockout_until"] = time.time() + lockout_seconds
+                    st.session_state["login_attempts"] = 0
+                    st.error("Too many failed attempts. Locked for 15 minutes.")
+                else:
+                    st.error(f"Incorrect PIN. {remaining_tries} attempt(s) left.")
 
 
 # --- Auth gate ---
