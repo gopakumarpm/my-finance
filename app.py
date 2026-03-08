@@ -4,8 +4,16 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import date, datetime, timedelta
 import hashlib
+import html as _html
 import time
 import database as db
+
+
+def _esc(val):
+    """HTML-escape user-supplied values to prevent XSS."""
+    if val is None:
+        return ""
+    return _html.escape(str(val))
 import gold_rate as gr
 import stock_price as sp
 import seed_data
@@ -21,10 +29,10 @@ def _hash_pin(pin):
 
 
 def _check_auth():
-    """Return True if user is authenticated."""
+    """Return True if user is authenticated. Fail closed if PIN_HASH missing."""
     pin_hash = st.secrets.get("PIN_HASH", "")
     if not pin_hash:
-        return True  # No PIN set, skip auth
+        return False  # Fail closed — block access if PIN not configured
     return st.session_state.get("authenticated", False)
 
 
@@ -56,35 +64,60 @@ def _show_login():
             label_visibility="collapsed",
         )
 
-        # --- Lockout logic ---
+        # --- Server-side lockout logic ---
         max_attempts = 5
         lockout_seconds = 900  # 15 minutes
-        if "login_attempts" not in st.session_state:
-            st.session_state["login_attempts"] = 0
-        if "lockout_until" not in st.session_state:
-            st.session_state["lockout_until"] = 0
 
-        locked = st.session_state["lockout_until"] > time.time()
-        if locked:
-            remaining = int(st.session_state["lockout_until"] - time.time())
-            mins, secs = divmod(remaining, 60)
-            st.error(f"Too many failed attempts. Try again in {mins}m {secs}s.")
-        elif st.button("Unlock", type="primary", use_container_width=True):
-            if not pin or len(pin) != 4 or not pin.isdigit():
-                st.error("Please enter a 4-digit PIN")
-            elif _hash_pin(pin) == st.secrets.get("PIN_HASH", ""):
-                st.session_state["authenticated"] = True
-                st.session_state["login_attempts"] = 0
-                st.rerun()
-            else:
-                st.session_state["login_attempts"] += 1
-                remaining_tries = max_attempts - st.session_state["login_attempts"]
-                if remaining_tries <= 0:
-                    st.session_state["lockout_until"] = time.time() + lockout_seconds
-                    st.session_state["login_attempts"] = 0
-                    st.error("Too many failed attempts. Locked for 15 minutes.")
+        def _get_lockout():
+            try:
+                row = db._sb().table("login_lockout").select("*").eq("ip_key", "global").single().execute()
+                return row.data
+            except Exception:
+                return {"attempts": 0, "locked_until": None}
+
+        def _set_lockout(attempts, locked_until=None):
+            try:
+                updates = {"attempts": attempts, "updated_at": datetime.utcnow().isoformat()}
+                if locked_until:
+                    updates["locked_until"] = locked_until
                 else:
-                    st.error(f"Incorrect PIN. {remaining_tries} attempt(s) left.")
+                    updates["locked_until"] = None
+                db._sb().table("login_lockout").update(updates).eq("ip_key", "global").execute()
+            except Exception:
+                pass
+
+        lockout = _get_lockout()
+        locked = False
+        if lockout.get("locked_until"):
+            lock_time = datetime.fromisoformat(lockout["locked_until"].replace("Z", "+00:00"))
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+            if now < lock_time:
+                locked = True
+                remaining = int((lock_time - now).total_seconds())
+                mins, secs = divmod(remaining, 60)
+                st.error(f"Too many failed attempts. Try again in {mins}m {secs}s.")
+            else:
+                _set_lockout(0)  # Lockout expired, reset
+
+        if not locked:
+            if st.button("Unlock", type="primary", use_container_width=True):
+                if not pin or len(pin) != 4 or not pin.isdigit():
+                    st.error("Please enter a 4-digit PIN")
+                elif _hash_pin(pin) == st.secrets.get("PIN_HASH", ""):
+                    st.session_state["authenticated"] = True
+                    _set_lockout(0)  # Reset on success
+                    st.rerun()
+                else:
+                    new_attempts = lockout.get("attempts", 0) + 1
+                    remaining_tries = max_attempts - new_attempts
+                    if remaining_tries <= 0:
+                        lock_until = (datetime.utcnow() + timedelta(seconds=lockout_seconds)).isoformat()
+                        _set_lockout(0, lock_until)
+                        st.error("Too many failed attempts. Locked for 15 minutes.")
+                    else:
+                        _set_lockout(new_attempts)
+                        st.error(f"Incorrect PIN. {remaining_tries} attempt(s) left.")
 
 
 # --- Auth gate ---
@@ -1725,9 +1758,9 @@ if page == "Dashboard":
                 table_rows += f"""
                 <tr>
                     <td style="font-weight:700;color:{COLORS['text_muted']};text-align:center;font-size:0.85rem;">{rank}</td>
-                    <td><span style="font-weight:600;color:{COLORS['text']}">{row['name']}</span>
-                        <div style="font-size:0.7rem;color:{COLORS['text_muted']}">{row['category']}</div></td>
-                    <td><span class="badge {badge_class}">{row['liquidity']}</span></td>
+                    <td><span style="font-weight:600;color:{COLORS['text']}">{_esc(row['name'])}</span>
+                        <div style="font-size:0.7rem;color:{COLORS['text_muted']}">{_esc(row['category'])}</div></td>
+                    <td><span class="badge {badge_class}">{_esc(row['liquidity'])}</span></td>
                     <td class="amount">{fmt_inr_full(row['balance'])}</td>
                     <td>
                         <div style="display:flex;align-items:center;gap:6px;">
@@ -1967,8 +2000,8 @@ if page == "Dashboard":
                 badge_class = "badge-liquid" if row["liquidity"] == "Liquid" else "badge-nonliquid"
                 detail_rows += f"""
                 <tr>
-                    <td><span style="font-weight:600;color:{COLORS['text']}">{row['name']}</span></td>
-                    <td><span class="badge {badge_class}">{row['liquidity']}</span></td>
+                    <td><span style="font-weight:600;color:{COLORS['text']}">{_esc(row['name'])}</span></td>
+                    <td><span class="badge {badge_class}">{_esc(row['liquidity'])}</span></td>
                     <td class="amount">{fmt_inr_full(row['balance'])}</td>
                     <td>
                         <div style="display:flex;align-items:center;gap:6px;">
@@ -1978,11 +2011,11 @@ if page == "Dashboard":
                             <span style="font-size:0.72rem;color:{COLORS['text_muted']};min-width:38px;text-align:right;">{pct:.1f}%</span>
                         </div>
                     </td>
-                    <td style="color:{COLORS['text_muted']};font-size:0.8rem;">{row['last_update'] or '-'}</td>
+                    <td style="color:{COLORS['text_muted']};font-size:0.8rem;">{_esc(row['last_update']) or '-'}</td>
                 </tr>"""
             st.markdown(f"""
             <table class="styled-table">
-                <thead><tr><th>Source</th><th>Type</th><th>Balance</th><th style="min-width:140px;">Share in {selected_cat}</th><th>Last Updated</th></tr></thead>
+                <thead><tr><th>Source</th><th>Type</th><th>Balance</th><th style="min-width:140px;">Share in {_esc(selected_cat)}</th><th>Last Updated</th></tr></thead>
                 <tbody>{detail_rows}</tbody>
             </table>
             """, unsafe_allow_html=True)
@@ -2007,9 +2040,9 @@ if page == "Dashboard":
             b_color = bar_colors.get(row["category"], COLORS["primary"])
             table_rows += f"""
             <tr>
-                <td><span style="font-weight:600;color:{COLORS['text']}">{row['name']}</span></td>
-                <td><span style="font-size:0.78rem;color:{COLORS['text_muted']}">{row['category']}</span></td>
-                <td><span class="badge {badge_class}">{row['liquidity']}</span></td>
+                <td><span style="font-weight:600;color:{COLORS['text']}">{_esc(row['name'])}</span></td>
+                <td><span style="font-size:0.78rem;color:{COLORS['text_muted']}">{_esc(row['category'])}</span></td>
+                <td><span class="badge {badge_class}">{_esc(row['liquidity'])}</span></td>
                 <td class="amount">{fmt_inr_full(row['balance'])}</td>
                 <td>
                     <div style="display:flex;align-items:center;gap:6px;">
@@ -2019,7 +2052,7 @@ if page == "Dashboard":
                         <span style="font-size:0.72rem;color:{COLORS['text_muted']};min-width:38px;text-align:right;">{pct:.1f}%</span>
                     </div>
                 </td>
-                <td style="color:{COLORS['text_muted']};font-size:0.8rem;">{row['last_update'] or '-'}</td>
+                <td style="color:{COLORS['text_muted']};font-size:0.8rem;">{_esc(row['last_update']) or '-'}</td>
             </tr>"""
 
         st.markdown(f"""
@@ -2187,7 +2220,7 @@ elif page == "Bank Update":
                     f'box-shadow:0 3px 10px {b_clr}25">'
                     f'<span style="font-size:1.2rem;filter:brightness(10)">{b_ico}</span></div>'
                     f'<div style="flex:1;min-width:160px">'
-                    f'<div style="font-size:0.95rem;font-weight:700;color:{COLORS["text"]}">{s["name"]}</div>'
+                    f'<div style="font-size:0.95rem;font-weight:700;color:{COLORS["text"]}">{_esc(s["name"])}</div>'
                     f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-top:2px">'
                     f'Updated: {last_dt}</div>'
                     f'<div style="display:flex;align-items:center;gap:8px;margin-top:5px">'
@@ -2270,11 +2303,11 @@ elif page == "Bank Update":
         if savings_sources and fd_sources:
             insights.append(f"Savings: <strong>{fmt_inr_full(savings_total)}</strong> (liquid) &middot; FD/RD: <strong>{fmt_inr_full(fd_total)}</strong> (locked, earning interest).")
         if total_bank > 0:
-            insights.append(f"Largest account: <strong>{largest_name}</strong> with {fmt_inr_full(largest_val)} ({largest_val / total_bank * 100:.1f}% of banking).")
+            insights.append(f"Largest account: <strong>{_esc(largest_name)}</strong> with {fmt_inr_full(largest_val)} ({largest_val / total_bank * 100:.1f}% of banking).")
         zero_accts = [name_map[sid] for sid, v in bk_balances.items() if v <= 0]
         if zero_accts:
             warn_c = COLORS["warning"]
-            insights.append(f"<span style='color:{warn_c}'>{len(zero_accts)} account(s) at zero: {', '.join(zero_accts)}.</span>")
+            insights.append(f"<span style='color:{warn_c}'>{len(zero_accts)} account(s) at zero: {_esc(', '.join(zero_accts))}.</span>")
         if fd_total > 0 and total_bank > 0:
             fd_ratio = fd_total / total_bank * 100
             succ_c = COLORS["success"]
@@ -2316,7 +2349,7 @@ elif page == "Bank Update":
                 f'<span style="font-size:1.3rem;filter:brightness(10)">{sel_ico}</span>'
                 f'<div>'
                 f'<div style="font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;'
-                f'color:rgba(255,255,255,0.7)">Current Balance — {selected}</div>'
+                f'color:rgba(255,255,255,0.7)">Current Balance — {_esc(selected)}</div>'
                 f'<div style="font-size:1.4rem;font-weight:800;color:#FFFFFF;margin-top:2px">{fmt_inr_full(current)}</div>'
                 f'</div></div></div>',
                 unsafe_allow_html=True)
@@ -2346,7 +2379,7 @@ elif page == "Bank Update":
                 quick_rows += (
                     f'<tr>'
                     f'<td style="font-weight:600;color:{COLORS["text"]};font-size:0.85rem">'
-                    f'<span style="color:{b_clr};margin-right:4px">{b_ico}</span> {s["name"]}'
+                    f'<span style="color:{b_clr};margin-right:4px">{b_ico}</span> {_esc(s["name"])}'
                     f'<span style="margin-left:6px;font-size:0.6rem;color:{COLORS["text_muted"]}">{cat_badge}</span></td>'
                     f'<td class="amount" style="text-align:right">{fmt_inr_full(bal)}</td>'
                     f'</tr>'
@@ -2516,7 +2549,7 @@ elif page == "Digital Wallet":
                 chg_arrow = "&#x25CF;"
                 chg_sign = ""
                 chg_text = "No change"
-            note_html = f' &middot; <em>{last_note}</em>' if last_note else ""
+            note_html = f' &middot; <em>{_esc(last_note)}</em>' if last_note else ""
             # Progress bar width
             bar_w = min(pct_of_total, 100)
             st.markdown(
@@ -2532,7 +2565,7 @@ elif page == "Digital Wallet":
                 f'<span style="font-size:1.4rem;filter:brightness(10)">{w_ico}</span></div>'
                 # Name & meta
                 f'<div style="flex:1;min-width:180px">'
-                f'<div style="font-size:1rem;font-weight:700;color:{COLORS["text"]}">{s["name"]}</div>'
+                f'<div style="font-size:1rem;font-weight:700;color:{COLORS["text"]}">{_esc(s["name"])}</div>'
                 f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-top:3px">'
                 f'Last updated: {last_dt}{note_html}</div>'
                 # Mini progress bar
@@ -2573,11 +2606,11 @@ elif page == "Digital Wallet":
         insights = []
         insights.append(f"Total digital wallet balance: <strong>{fmt_inr_full(dw_total)}</strong> ({dw_nw_pct:.1f}% of net worth).")
         if top_wallet:
-            insights.append(f"Highest balance: <strong>{top_wallet['name']}</strong> at {fmt_inr_full(dw_balances[top_wallet['id']])}.")
+            insights.append(f"Highest balance: <strong>{_esc(top_wallet['name'])}</strong> at {fmt_inr_full(dw_balances[top_wallet['id']])}.")
         zero_wallets = [s for s in dw_sources if dw_balances[s["id"]] == 0]
         if zero_wallets:
             names = ", ".join(s["name"] for s in zero_wallets[:3])
-            insights.append(f"&#x26a0;&#xfe0f; {len(zero_wallets)} wallet(s) at zero balance: {names}.")
+            insights.append(f"&#x26a0;&#xfe0f; {len(zero_wallets)} wallet(s) at zero balance: {_esc(names)}.")
         if dw_total > 50000:
             insights.append("Consider moving excess wallet balance to a savings account or investment for better returns.")
         elif dw_total > 0:
@@ -2609,7 +2642,7 @@ elif page == "Digital Wallet":
                 f'<span style="font-size:1.3rem;filter:brightness(10)">{sel_ico}</span>'
                 f'<div>'
                 f'<div style="font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;'
-                f'color:rgba(255,255,255,0.7)">Current Balance — {selected}</div>'
+                f'color:rgba(255,255,255,0.7)">Current Balance — {_esc(selected)}</div>'
                 f'<div style="font-size:1.4rem;font-weight:800;color:#FFFFFF;margin-top:2px">{fmt_inr_full(current)}</div>'
                 f'</div></div></div>',
                 unsafe_allow_html=True)
@@ -2638,7 +2671,7 @@ elif page == "Digital Wallet":
                 quick_rows += (
                     f'<tr>'
                     f'<td style="font-weight:600;color:{COLORS["text"]};font-size:0.85rem">'
-                    f'<span style="color:{w_clr};margin-right:4px">{w_ico}</span> {s["name"]}</td>'
+                    f'<span style="color:{w_clr};margin-right:4px">{w_ico}</span> {_esc(s["name"])}</td>'
                     f'<td class="amount" style="text-align:right">{fmt_inr_full(bal)}</td>'
                     f'</tr>'
                 )
@@ -2816,7 +2849,7 @@ elif page == "Manage Sources":
                 st.markdown(
                     f'<div style="display:flex;align-items:center;gap:8px;margin:20px 0 10px 0">'
                     f'<span style="font-size:1.1rem">{cat_ico}</span>'
-                    f'<span style="font-size:0.95rem;font-weight:800;color:{COLORS["text"]}">{cat_name}</span>'
+                    f'<span style="font-size:0.95rem;font-weight:800;color:{COLORS["text"]}">{_esc(cat_name)}</span>'
                     f'<span style="background:{cat_clr}18;color:{cat_clr};padding:2px 10px;border-radius:10px;'
                     f'font-size:0.72rem;font-weight:600">{len(cat_srcs)} source{"s" if len(cat_srcs) != 1 else ""}</span>'
                     f'<div style="flex:1;height:1px;background:{COLORS["card_border"]};margin-left:8px"></div>'
@@ -2839,9 +2872,9 @@ elif page == "Manage Sources":
                         f'box-shadow:{COLORS["card_shadow"]};display:flex;align-items:center;gap:14px">'
                         f'<div style="flex:1">'
                         f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-                        f'<span style="font-size:0.95rem;font-weight:700;color:{COLORS["text"]}">{s["name"]}</span>'
+                        f'<span style="font-size:0.95rem;font-weight:700;color:{COLORS["text"]}">{_esc(s["name"])}</span>'
                         f'<span style="background:{liq_clr}15;color:{liq_clr};padding:2px 8px;border-radius:8px;'
-                        f'font-size:0.68rem;font-weight:600">{liq_label}</span>'
+                        f'font-size:0.68rem;font-weight:600">{_esc(liq_label)}</span>'
                         f'{gold_badge}</div>'
                         f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:3px">'
                         f'ID: {s["id"]} &middot; Added to portfolio</div>'
@@ -2937,11 +2970,11 @@ elif page == "Manage Sources":
                     f'<div style="flex:1">'
                     f'<div style="display:flex;align-items:center;gap:8px">'
                     f'<span style="font-size:0.95rem;font-weight:700;color:{COLORS["text_secondary"]};'
-                    f'text-decoration:line-through">{s["name"]}</span>'
+                    f'text-decoration:line-through">{_esc(s["name"])}</span>'
                     f'<span style="background:#CBD5E115;color:#94A3B8;padding:2px 8px;border-radius:8px;'
                     f'font-size:0.68rem;font-weight:600">Inactive</span></div>'
                     f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:3px">'
-                    f'{s["category"]} &middot; {s["liquidity"]}</div>'
+                    f'{_esc(s["category"])} &middot; {_esc(s["liquidity"])}</div>'
                     f'</div></div>',
                     unsafe_allow_html=True)
 
@@ -3069,7 +3102,7 @@ elif page == "History & Analytics":
                         f'padding:14px 16px;box-shadow:{COLORS["card_shadow"]};border-top:3px solid {cc};margin-bottom:4px">'
                         f'<div style="display:flex;align-items:center;gap:6px">'
                         f'<span style="font-size:1rem">{ico}</span>'
-                        f'<span style="font-size:0.78rem;font-weight:700;color:{COLORS["text"]}">{cat}</span>'
+                        f'<span style="font-size:0.78rem;font-weight:700;color:{COLORS["text"]}">{_esc(cat)}</span>'
                         f'<span style="margin-left:auto;font-size:0.65rem;color:{COLORS["text_muted"]}">{src_count} source{"s" if src_count!=1 else ""}</span></div>'
                         f'<div style="font-size:1.2rem;font-weight:900;color:{COLORS["text"]};margin:6px 0">{fmt_inr(bal)}</div>'
                         f'<div style="background:{COLORS["surface"]};border-radius:4px;height:6px;overflow:hidden">'
@@ -3099,7 +3132,7 @@ elif page == "History & Analytics":
                     f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">'
                     f'<span style="font-size:1.4rem">{eco}</span>'
                     f'<div>'
-                    f'<div style="font-size:1.05rem;font-weight:800;color:{COLORS["text"]}">{expanded_cat}</div>'
+                    f'<div style="font-size:1.05rem;font-weight:800;color:{COLORS["text"]}">{_esc(expanded_cat)}</div>'
                     f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]}">'
                     f'{len(cat_sources)} source{"s" if len(cat_sources)!=1 else ""} &middot; '
                     f'{fmt_inr(cat_total)} total</div></div>'
@@ -3126,14 +3159,14 @@ elif page == "History & Analytics":
                         f'border-left:3px solid {ecc}">'
                         f'<div style="flex:1">'
                         f'<div style="display:flex;align-items:center;gap:6px">'
-                        f'<span style="font-size:0.85rem;font-weight:700;color:{COLORS["text"]}">{src["name"]}</span>'
+                        f'<span style="font-size:0.85rem;font-weight:700;color:{COLORS["text"]}">{_esc(src["name"])}</span>'
                         f'<span style="background:{liq_color}15;color:{liq_color};padding:1px 7px;border-radius:6px;'
                         f'font-size:0.65rem;font-weight:600">{liq_tag}</span></div>'
-                        f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">Last updated: {src.get("last_update", "N/A")}{gold_info}</div>'
+                        f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">Last updated: {_esc(src.get("last_update", "N/A"))}{gold_info}</div>'
                         f'</div>'
                         f'<div style="text-align:right">'
                         f'<div style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(src["balance"])}</div>'
-                        f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{src_pct:.1f}% of {expanded_cat}</div>'
+                        f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{src_pct:.1f}% of {_esc(expanded_cat)}</div>'
                         f'</div></div>',
                         unsafe_allow_html=True)
 
@@ -3362,15 +3395,15 @@ elif page == "History & Analytics":
                 arrow = "&#x2B06;" if is_positive else "&#x2B07;"
                 chg_color = COLORS["success"] if is_positive else COLORS["danger"]
                 sign = "+" if is_positive else ""
-                note_html = f' <span style="color:{COLORS["text_muted"]};font-style:italic">&middot; {r["note"]}</span>' if r["note"] else ""
+                note_html = f' <span style="color:{COLORS["text_muted"]};font-style:italic">&middot; {_esc(r["note"])}</span>' if r["note"] else ""
                 st.markdown(
                     f'<div style="display:flex;align-items:center;gap:12px;padding:10px 16px;margin-bottom:3px;'
                     f'background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:10px;'
                     f'border-left:3px solid {chg_color}">'
                     f'<div style="font-size:1.1rem;min-width:20px">{arrow}</div>'
                     f'<div style="flex:1">'
-                    f'<div style="font-size:0.85rem;font-weight:600;color:{COLORS["text"]}">{r["source_name"]}'
-                    f'<span style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-left:6px">{r["category"]}</span>{note_html}</div>'
+                    f'<div style="font-size:0.85rem;font-weight:600;color:{COLORS["text"]}">{_esc(r["source_name"])}'
+                    f'<span style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-left:6px">{_esc(r["category"])}</span>{note_html}</div>'
                     f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{r["update_date"]} &middot; '
                     f'{fmt_inr(r["previous_balance"] or 0)} &rarr; {fmt_inr(r["balance"])}</div></div>'
                     f'<div style="text-align:right">'
@@ -3391,18 +3424,18 @@ elif page == "History & Analytics":
                 mv_insights.append(f"In the selected period: <strong>{fmt_inr_full(positive)}</strong> came in, <strong>{fmt_inr_full(abs(negative))}</strong> went out. Net: <strong>{'+' if net>=0 else ''}{fmt_inr_full(net)}</strong>.")
                 if not top_inflows.empty:
                     top_in = top_inflows.iloc[0]
-                    mv_insights.append(f"Biggest credit: <strong>{top_in['source_name']}</strong> on {top_in['update_date']} (+{fmt_inr(top_in['change_amount'])}).")
+                    mv_insights.append(f"Biggest credit: <strong>{_esc(top_in['source_name'])}</strong> on {top_in['update_date']} (+{fmt_inr(top_in['change_amount'])}).")
                 if not top_outflows.empty:
                     top_out = top_outflows.iloc[0]
-                    mv_insights.append(f"Biggest debit: <strong>{top_out['source_name']}</strong> on {top_out['update_date']} ({fmt_inr(top_out['change_amount'])}).")
+                    mv_insights.append(f"Biggest debit: <strong>{_esc(top_out['source_name'])}</strong> on {top_out['update_date']} ({fmt_inr(top_out['change_amount'])}).")
                 most_active = log_df["source_name"].value_counts().head(1)
                 if not most_active.empty:
-                    mv_insights.append(f"Most active: <strong>{most_active.index[0]}</strong> with {most_active.values[0]} updates.")
+                    mv_insights.append(f"Most active: <strong>{_esc(most_active.index[0])}</strong> with {most_active.values[0]} updates.")
                 if not by_source.empty:
                     growers = by_source[by_source > 0]
                     shrinkers = by_source[by_source < 0]
                     if not growers.empty:
-                        mv_insights.append(f"Sources that grew: {', '.join(f'<strong>{n}</strong> (+{fmt_inr(v)})' for n, v in growers.items())}.")
+                        mv_insights.append(f"Sources that grew: {', '.join(f'<strong>{_esc(n)}</strong> (+{fmt_inr(v)})' for n, v in growers.items())}.")
                 insight_box(mv_insights, "Movement Insights")
         else:
             st.info("No activity in selected period. Try a wider date range.")
@@ -3469,8 +3502,8 @@ elif page == "History & Analytics":
                         f'background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:10px;'
                         f'border-left:3px solid {COLORS["success"]}">'
                         f'<div style="flex:1">'
-                        f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{r["name"]}'
-                        f'<span style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-left:6px">{r.get("category", "")}</span></div>'
+                        f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{_esc(r["name"])}'
+                        f'<span style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-left:6px">{_esc(r.get("category", ""))}</span></div>'
                         f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{fmt_inr(r["bal_a"])} &rarr; {fmt_inr(r["bal_b"])}</div></div>'
                         f'<div style="font-size:1rem;font-weight:800;color:{COLORS["success"]}">+{fmt_inr(r["change"])}{pct_str}</div></div>',
                         unsafe_allow_html=True)
@@ -3484,8 +3517,8 @@ elif page == "History & Analytics":
                         f'background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:10px;'
                         f'border-left:3px solid {COLORS["danger"]}">'
                         f'<div style="flex:1">'
-                        f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{r["name"]}'
-                        f'<span style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-left:6px">{r.get("category", "")}</span></div>'
+                        f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{_esc(r["name"])}'
+                        f'<span style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-left:6px">{_esc(r.get("category", ""))}</span></div>'
                         f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{fmt_inr(r["bal_a"])} &rarr; {fmt_inr(r["bal_b"])}</div></div>'
                         f'<div style="font-size:1rem;font-weight:800;color:{COLORS["danger"]}">{fmt_inr(r["change"])}{pct_str}</div></div>',
                         unsafe_allow_html=True)
@@ -3494,7 +3527,7 @@ elif page == "History & Analytics":
                 st.markdown(
                     f'<div style="margin-top:10px;padding:10px 16px;background:{COLORS["surface"]};border-radius:10px;'
                     f'font-size:0.82rem;color:{COLORS["text_muted"]}">'
-                    f'No change: {", ".join(unchanged["name"].tolist())}</div>',
+                    f'No change: {_esc(", ".join(unchanged["name"].tolist()))}</div>',
                     unsafe_allow_html=True)
 
             # Comparison insights
@@ -3502,10 +3535,10 @@ elif page == "History & Analytics":
             c_insights.append(f"In <strong>{days_diff} days</strong>, your net worth {'grew' if total_chg>=0 else 'decreased'} by <strong>{chg_sign}{fmt_inr_full(total_chg)}</strong> ({total_pct:+.1f}%).")
             if not winners.empty:
                 top_winner = winners.iloc[0]
-                c_insights.append(f"Biggest gainer: <strong>{top_winner['name']}</strong> (+{fmt_inr(top_winner['change'])}).")
+                c_insights.append(f"Biggest gainer: <strong>{_esc(top_winner['name'])}</strong> (+{fmt_inr(top_winner['change'])}).")
             if not losers.empty:
                 top_loser = losers.iloc[0]
-                c_insights.append(f"Biggest drop: <strong>{top_loser['name']}</strong> ({fmt_inr(top_loser['change'])}).")
+                c_insights.append(f"Biggest drop: <strong>{_esc(top_loser['name'])}</strong> ({fmt_inr(top_loser['change'])}).")
             if days_diff > 0 and total_chg != 0:
                 daily_rate = total_chg / days_diff
                 c_insights.append(f"That's roughly <strong>{'+' if daily_rate>=0 else ''}{fmt_inr_full(daily_rate)}/day</strong> or <strong>{'+' if daily_rate>=0 else ''}{fmt_inr_full(daily_rate*30)}/month</strong>.")
@@ -3831,13 +3864,13 @@ elif page == "Gold Portfolio":
                             f'box-shadow:{COLORS["card_shadow"]};border-left:3px solid {G["accent"]}">'
                             f'<div style="min-width:44px;text-align:center">'
                             f'<span style="background:{G["cream"]};color:{G["warm"]};padding:3px 10px;'
-                            f'border-radius:10px;font-size:0.78rem;font-weight:700">{p["carat"]}</span></div>'
+                            f'border-radius:10px;font-size:0.78rem;font-weight:700">{_esc(p["carat"])}</span></div>'
                             f'<div style="flex:1;min-width:0">'
-                            f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{p["description"]}'
-                            f'<span style="font-weight:400;color:{COLORS["text_muted"]};font-size:0.78rem;margin-left:8px">{p["seller"] or ""}</span></div>'
+                            f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{_esc(p["description"])}'
+                            f'<span style="font-weight:400;color:{COLORS["text_muted"]};font-size:0.78rem;margin-left:8px">{_esc(p["seller"] or "")}</span></div>'
                             f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:2px">'
                             f'{p["weight_grams"]:.3f}g &middot; Buy: Rs. {buy_ppg:,.0f}/g &middot; {p["purchase_date"]}'
-                            f'{" &middot; " + p["note"] if p["note"] else ""}</div></div>'
+                            f'{" &middot; " + _esc(p["note"]) if p["note"] else ""}</div></div>'
                             f'<div style="text-align:right;min-width:160px">'
                             f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">Buy: {fmt_inr(p["total_purchase_price"])}</div>'
                             f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]};margin-top:1px">{mkt_html}{var_html}</div>'
@@ -3960,7 +3993,7 @@ elif page == "Gold Portfolio":
                             f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{p["weight_grams"]:.4f}g'
                             f'<span style="font-size:0.75rem;font-weight:400;color:{COLORS["text_muted"]};margin-left:8px">'
                             f'24K &middot; Buy: Rs. {p["purchase_price_per_gram"]:,.0f}/g &middot; {p["purchase_date"]}'
-                            f'{" &middot; " + p["note"] if p["note"] else ""}</span></div></div>'
+                            f'{" &middot; " + _esc(p["note"]) if p["note"] else ""}</span></div></div>'
                             f'<div style="text-align:right;min-width:150px">'
                             f'<div style="font-size:0.85rem;font-weight:700;color:{COLORS["text"]}">Buy: {fmt_inr(p["total_purchase_price"])}</div>'
                             f'<div style="font-size:0.75rem">{mkt_html}{var_html}</div></div></div>',
@@ -4011,8 +4044,8 @@ elif page == "Gold Portfolio":
                         f'padding:16px 20px;margin-bottom:8px;box-shadow:{COLORS["card_shadow"]};border-left:4px solid {G["accent"]}">'
                         f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">'
                         f'<div>'
-                        f'<div style="font-size:0.95rem;font-weight:800;color:{COLORS["text"]}">{s["scheme_name"]}</div>'
-                        f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]}">{s["jeweller"]} &middot; Rs. {s["monthly_amount"]:,.0f}/mo &middot; Started {s["start_date"] or "N/A"}</div>'
+                        f'<div style="font-size:0.95rem;font-weight:800;color:{COLORS["text"]}">{_esc(s["scheme_name"])}</div>'
+                        f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]}">{_esc(s["jeweller"])} &middot; Rs. {s["monthly_amount"]:,.0f}/mo &middot; Started {s["start_date"] or "N/A"}</div>'
                         f'</div>'
                         f'<div style="text-align:right">'
                         f'<div style="font-size:1.05rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(s["total_deposited"])}</div>'
@@ -4038,8 +4071,8 @@ elif page == "Gold Portfolio":
                         f'<div style="background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:10px;'
                         f'padding:12px 16px;margin-bottom:6px;opacity:0.8">'
                         f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                        f'<div><span style="font-weight:700;color:{COLORS["text"]}">{s["scheme_name"]}</span>'
-                        f'<span style="font-size:0.78rem;color:{COLORS["text_muted"]};margin-left:8px">{s["jeweller"]}</span></div>'
+                        f'<div><span style="font-weight:700;color:{COLORS["text"]}">{_esc(s["scheme_name"])}</span>'
+                        f'<span style="font-size:0.78rem;color:{COLORS["text_muted"]};margin-left:8px">{_esc(s["jeweller"])}</span></div>'
                         f'<div style="text-align:right">'
                         f'<span style="font-weight:700;color:{COLORS["text"]}">{fmt_inr(s["total_deposited"])}</span>'
                         f'<span style="background:{COLORS["success"]}15;color:{COLORS["success"]};padding:2px 8px;border-radius:8px;'
@@ -4255,10 +4288,10 @@ elif page == "Shares & Stock":
                             f'box-shadow:{COLORS["card_shadow"]};border-left:3px solid #F97316">'
                             f'<div style="min-width:56px;text-align:center">'
                             f'<span style="background:{COLORS["surface2"]};padding:3px 10px;border-radius:10px;'
-                            f'font-size:0.78rem;font-weight:700;color:{COLORS["primary"]}">{h["ticker"]}</span>'
-                            f'<div style="font-size:0.65rem;color:{COLORS["text_muted"]};margin-top:3px">{h["exchange"]}</div></div>'
+                            f'font-size:0.78rem;font-weight:700;color:{COLORS["primary"]}">{_esc(h["ticker"])}</span>'
+                            f'<div style="font-size:0.65rem;color:{COLORS["text_muted"]};margin-top:3px">{_esc(h["exchange"])}</div></div>'
                             f'<div style="flex:1;min-width:0">'
-                            f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{h["name"]}</div>'
+                            f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{_esc(h["name"])}</div>'
                             f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:2px">'
                             f'{h["quantity"]:,.3f} qty &middot; Buy: {fmt_inr_full(h["buy_price_per_unit"])}/unit'
                             f'{" &middot; CMP: " + fmt_inr_full(cp) if cp else ""}'
@@ -4296,12 +4329,12 @@ elif page == "Shares & Stock":
                         sell_rows = ""
                         for s in india_sells:
                             sell_rows += (
-                                f'<tr><td style="font-weight:500;color:{COLORS["text"]}">{s["name"]} ({s["ticker"]})</td>'
+                                f'<tr><td style="font-weight:500;color:{COLORS["text"]}">{_esc(s["name"])} ({_esc(s["ticker"])})</td>'
                                 f'<td style="text-align:right">{s["quantity_sold"]:,.3f}</td>'
                                 f'<td class="amount">{fmt_inr_full(s["sell_price_per_unit"])}</td>'
                                 f'<td class="amount">{fmt_inr_full(s["total_sell_price"])}</td>'
                                 f'<td style="color:{COLORS["text_muted"]};font-size:0.85rem">{s["sell_date"]}</td>'
-                                f'<td style="color:{COLORS["text_muted"]};font-size:0.85rem">{s["note"] or ""}</td></tr>'
+                                f'<td style="color:{COLORS["text_muted"]};font-size:0.85rem">{_esc(s["note"] or "")}</td></tr>'
                             )
                         st.markdown(
                             f'<table class="styled-table"><thead><tr>'
@@ -4324,14 +4357,14 @@ elif page == "Shares & Stock":
                     if len(in_returns) > 1:
                         best = max(in_returns, key=lambda x: x[1])
                         worst = min(in_returns, key=lambda x: x[1])
-                        in_insights.append(f"Best: <strong>{best[0]}</strong> ({best[1]:+.1f}%). Worst: <strong>{worst[0]}</strong> ({worst[1]:+.1f}%).")
+                        in_insights.append(f"Best: <strong>{_esc(best[0])}</strong> ({best[1]:+.1f}%). Worst: <strong>{_esc(worst[0])}</strong> ({worst[1]:+.1f}%).")
                     # Exchange breakdown
                     exchanges = {}
                     for h in india_holdings:
                         ex = h["exchange"] or "Unknown"
                         exchanges[ex] = exchanges.get(ex, 0) + 1
                     if len(exchanges) > 1:
-                        ex_str = ", ".join(f"{k}: {v}" for k, v in exchanges.items())
+                        ex_str = ", ".join(f"{_esc(k)}: {v}" for k, v in exchanges.items())
                         in_insights.append(f"Exchange split: {ex_str}.")
                     insight_box(in_insights, "Indian Market Insights")
                 else:
@@ -4404,10 +4437,10 @@ elif page == "Shares & Stock":
                             f'box-shadow:{COLORS["card_shadow"]};border-left:3px solid #3B82F6">'
                             f'<div style="min-width:56px;text-align:center">'
                             f'<span style="background:#EFF6FF;padding:3px 10px;border-radius:10px;'
-                            f'font-size:0.78rem;font-weight:700;color:#1D4ED8">{h["ticker"]}</span>'
-                            f'<div style="font-size:0.65rem;color:{COLORS["text_muted"]};margin-top:3px">{h["exchange"]}</div></div>'
+                            f'font-size:0.78rem;font-weight:700;color:#1D4ED8">{_esc(h["ticker"])}</span>'
+                            f'<div style="font-size:0.65rem;color:{COLORS["text_muted"]};margin-top:3px">{_esc(h["exchange"])}</div></div>'
                             f'<div style="flex:1;min-width:0">'
-                            f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{h["name"]}</div>'
+                            f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{_esc(h["name"])}</div>'
                             f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:2px">'
                             f'{h["quantity"]:,.3f} qty &middot; Buy: $ {h["buy_price_per_unit"]:,.2f}/unit'
                             f'{cmp_str}{vd_str}</div></div>'
@@ -4443,7 +4476,7 @@ elif page == "Shares & Stock":
                         for s in us_sells:
                             inr_total = s["total_sell_price"] * usd_inr if usd_inr else None
                             sell_rows += (
-                                f'<tr><td style="font-weight:500;color:{COLORS["text"]}">{s["name"]} ({s["ticker"]})</td>'
+                                f'<tr><td style="font-weight:500;color:{COLORS["text"]}">{_esc(s["name"])} ({_esc(s["ticker"])})</td>'
                                 f'<td style="text-align:right">{s["quantity_sold"]:,.3f}</td>'
                                 f'<td class="amount">$ {s["sell_price_per_unit"]:,.2f}</td>'
                                 f'<td class="amount">$ {s["total_sell_price"]:,.2f}</td>'
@@ -4473,7 +4506,7 @@ elif page == "Shares & Stock":
                     if len(us_returns) > 1:
                         best = max(us_returns, key=lambda x: x[1])
                         worst = min(us_returns, key=lambda x: x[1])
-                        us_insights.append(f"Best: <strong>{best[0]}</strong> ({best[1]:+.1f}%). Worst: <strong>{worst[0]}</strong> ({worst[1]:+.1f}%).")
+                        us_insights.append(f"Best: <strong>{_esc(best[0])}</strong> ({best[1]:+.1f}%). Worst: <strong>{_esc(worst[0])}</strong> ({worst[1]:+.1f}%).")
                     insight_box(us_insights, "US Market Insights")
                 else:
                     st.markdown(
@@ -4564,7 +4597,7 @@ elif page == "Shares & Stock":
                         <td class="amount">{currency_sym} {v['current_price']:,.2f}</td>
                         <td class="amount">{currency_sym} {v['current_value']:,.2f}</td>
                         <td class="amount {v_class}">{'+' if v_gain >= 0 else ''}{currency_sym} {v_gain:,.2f} ({v_gain_pct:+.1f}%)</td>
-                        <td style="color:{COLORS['text_muted']};font-size:0.85rem">{v['note'] or ''}</td>
+                        <td style="color:{COLORS['text_muted']};font-size:0.85rem">{_esc(v['note'] or '')}</td>
                     </tr>"""
                 st.markdown(f"""
                 <table class="styled-table">
@@ -5054,7 +5087,7 @@ elif page == "SIP & MF Portfolio":
                         st.markdown(
                             f'<div style="background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:12px;'
                             f'padding:14px 16px;box-shadow:{COLORS["card_shadow"]};border-left:4px solid {pc};margin-bottom:8px">'
-                            f'<div style="font-size:0.82rem;font-weight:700;color:{COLORS["text"]}">{plat}</div>'
+                            f'<div style="font-size:0.82rem;font-weight:700;color:{COLORS["text"]}">{_esc(plat)}</div>'
                             f'<div style="font-size:1.1rem;font-weight:800;color:{COLORS["text"]};margin:4px 0">{fmt_inr(data["current"])}</div>'
                             f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{data["count"]} fund{"s" if data["count"]!=1 else ""}'
                             f' &middot; Invested: {fmt_inr(data["invested"])}</div>'
@@ -5116,7 +5149,7 @@ elif page == "SIP & MF Portfolio":
                         st.markdown(
                             f'<div style="background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:12px;'
                             f'padding:14px 16px;box-shadow:{COLORS["card_shadow"]};border-top:3px solid {color};margin-bottom:8px">'
-                            f'<div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{color}">{cat}</div>'
+                            f'<div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{color}">{_esc(cat)}</div>'
                             f'<div style="font-size:1.05rem;font-weight:800;color:{COLORS["text"]};margin:4px 0">{fmt_inr(data["current"])}</div>'
                             f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{data["count"]} fund{"s" if data["count"]!=1 else ""}'
                             f' &middot; {fmt_inr(data["monthly"])}/mo</div>'
@@ -5153,7 +5186,7 @@ elif page == "SIP & MF Portfolio":
                 cat_color = cat_colors.get(s["category"], "#6B7280")
                 p_color = plat_colors.get(s["amc"] or "", "#6B7280")
                 units_str = f" &middot; {s['units_held']:.2f} units" if s["units_held"] > 0 else ""
-                folio_str = f" &middot; {s['folio_number']}" if s["folio_number"] else ""
+                folio_str = f" &middot; {_esc(s['folio_number'])}" if s["folio_number"] else ""
                 inv_type = _row_get(s, "investment_type", "SIP")
                 type_clr = COLORS["accent"] if inv_type == "SIP" else "#D97706"
                 # Detail line
@@ -5172,12 +5205,12 @@ elif page == "SIP & MF Portfolio":
                     f'<span style="background:{type_clr}15;color:{type_clr};padding:2px 10px;border-radius:8px;'
                     f'font-size:0.68rem;font-weight:700">{inv_type}</span>'
                     f'<span style="background:{p_color}15;color:{p_color};padding:2px 10px;border-radius:8px;'
-                    f'font-size:0.68rem;font-weight:700">{s["amc"] or "Unknown"}</span>'
+                    f'font-size:0.68rem;font-weight:700">{_esc(s["amc"] or "Unknown")}</span>'
                     f'<span style="background:{cat_color}15;color:{cat_color};padding:2px 8px;border-radius:8px;'
-                    f'font-size:0.65rem;font-weight:600">{s["category"]}</span>'
+                    f'font-size:0.65rem;font-weight:600">{_esc(s["category"])}</span>'
                     f'<span style="background:{s_color}15;color:{s_color};padding:2px 8px;border-radius:8px;'
-                    f'font-size:0.62rem;font-weight:600">{s["status"]}</span></div>'
-                    f'<div style="font-size:0.95rem;font-weight:700;color:{COLORS["text"]};line-height:1.3">{s["fund_name"]}</div>'
+                    f'font-size:0.62rem;font-weight:600">{_esc(s["status"])}</span></div>'
+                    f'<div style="font-size:0.95rem;font-weight:700;color:{COLORS["text"]};line-height:1.3">{_esc(s["fund_name"])}</div>'
                     f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:4px">{detail_line}</div></div>'
                     f'<div style="text-align:right;min-width:160px">'
                     f'<div style="display:flex;gap:20px;justify-content:flex-end;margin-bottom:6px">'
@@ -5210,16 +5243,16 @@ elif page == "SIP & MF Portfolio":
             if len(fund_returns) > 1:
                 best = max(fund_returns, key=lambda x: x[1])
                 worst = min(fund_returns, key=lambda x: x[1])
-                insights.append(f"Best performer: <strong>{best[0]}</strong> ({best[1]:+.1f}%). Weakest: <strong>{worst[0]}</strong> ({worst[1]:+.1f}%).")
+                insights.append(f"Best performer: <strong>{_esc(best[0])}</strong> ({best[1]:+.1f}%). Weakest: <strong>{_esc(worst[0])}</strong> ({worst[1]:+.1f}%).")
             # Platform split
             for plat, data in plat_data.items():
                 pct = (data["current"] / total_current * 100) if total_current > 0 else 0
                 g = data["current"] - data["invested"]
-                insights.append(f"<strong>{plat}</strong>: {data['count']} fund{'s' if data['count']!=1 else ''}, {fmt_inr(data['current'])} ({pct:.0f}%), return {'+'if g>=0 else ''}{fmt_inr(g)}.")
+                insights.append(f"<strong>{_esc(plat)}</strong>: {data['count']} fund{'s' if data['count']!=1 else ''}, {fmt_inr(data['current'])} ({pct:.0f}%), return {'+'if g>=0 else ''}{fmt_inr(g)}.")
             # Category allocation
             for cat, data in cat_data.items():
                 pct = (data["current"] / total_current * 100) if total_current > 0 else 0
-                insights.append(f"{cat}: {pct:.0f}% allocation ({fmt_inr(data['current'])}).")
+                insights.append(f"{_esc(cat)}: {pct:.0f}% allocation ({fmt_inr(data['current'])}).")
             # Net worth context
             all_src = db.get_sources()
             nw = sum(db.get_latest_balance(src["id"]) for src in all_src)
@@ -5267,8 +5300,8 @@ elif page == "SIP & MF Portfolio":
                     f'padding:12px 16px;margin-bottom:4px;box-shadow:{COLORS["card_shadow"]}">'
                     f'<div style="display:flex;align-items:center;gap:8px">'
                     f'<span style="background:{p_color}15;color:{p_color};padding:2px 8px;border-radius:6px;'
-                    f'font-size:0.65rem;font-weight:700">{s["amc"] or "?"}</span>'
-                    f'<span style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{s["fund_name"]}</span>'
+                    f'font-size:0.65rem;font-weight:700">{_esc(s["amc"] or "?")}</span>'
+                    f'<span style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{_esc(s["fund_name"])}</span>'
                     f'<span style="margin-left:auto;font-size:0.78rem;color:{COLORS["text_muted"]}">Invested: {fmt_inr(s["total_invested"])}</span>'
                     f'<span style="font-size:0.78rem;font-weight:600;color:{gc}">{"+" if s_gain>=0 else ""}{s_gain_pct:.1f}%</span>'
                     f'</div></div>',
@@ -5379,7 +5412,7 @@ elif page == "SIP & MF Portfolio":
                                     unsafe_allow_html=True)
                             with rc[4]:
                                 st.markdown(
-                                    f'<div style="padding:8px 0;font-size:0.75rem;color:{COLORS["text_muted"]}">{v["note"] or ""}</div>',
+                                    f'<div style="padding:8px 0;font-size:0.75rem;color:{COLORS["text_muted"]}">{_esc(v["note"] or "")}</div>',
                                     unsafe_allow_html=True)
                             with rc[5]:
                                 if st.button("\u270f\ufe0f", key=f"vh_edit_{vid}", help="Edit"):
@@ -5594,7 +5627,7 @@ elif page == "Policies":
                             f'<div style="background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:12px;'
                             f'padding:14px 16px;box-shadow:{COLORS["card_shadow"]};border-left:4px solid {pc};margin-bottom:8px">'
                             f'<div style="display:flex;justify-content:space-between;align-items:center">'
-                            f'<div style="font-size:0.82rem;font-weight:700;color:{COLORS["text"]}">{s["provider"]}</div>'
+                            f'<div style="font-size:0.82rem;font-weight:700;color:{COLORS["text"]}">{_esc(s["provider"])}</div>'
                             f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]}">{s["count"]} {"policy" if s["count"]==1 else "policies"}</div></div>'
                             f'<div style="font-size:1.15rem;font-weight:800;color:{COLORS["text"]};margin:6px 0">{fmt_inr(s["total_value"])}</div>'
                             f'<div style="display:flex;justify-content:space-between;align-items:center;font-size:0.78rem">'
@@ -5663,10 +5696,10 @@ elif page == "Policies":
                         f'padding:12px 16px;margin-bottom:6px;box-shadow:{COLORS["card_shadow"]}">'
                         f'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
                         f'<div style="display:flex;align-items:center;gap:8px">'
-                        f'<span style="font-size:0.82rem;font-weight:700;color:{COLORS["text"]}">{p["name"]}</span>'
-                        f'<span style="background:{tc}15;color:{tc};padding:1px 8px;border-radius:8px;font-size:0.72rem;font-weight:600">{p["policy_type"]}</span>'
+                        f'<span style="font-size:0.82rem;font-weight:700;color:{COLORS["text"]}">{_esc(p["name"])}</span>'
+                        f'<span style="background:{tc}15;color:{tc};padding:1px 8px;border-radius:8px;font-size:0.72rem;font-weight:600">{_esc(p["policy_type"])}</span>'
                         f'</div>'
-                        f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]}">{p["provider"]}</div></div>'
+                        f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]}">{_esc(p["provider"])}</div></div>'
                         f'<div style="background:{COLORS["surface"]};border-radius:6px;height:10px;overflow:hidden;margin-bottom:6px">'
                         f'<div style="width:{pct:.1f}%;height:100%;background:linear-gradient(90deg,{bar_color},{bar_color}cc);'
                         f'border-radius:6px;transition:width 0.5s ease"></div></div>'
@@ -5831,7 +5864,7 @@ elif page == "Policies":
                     except ValueError:
                         mat_html = f'<span style="font-size:0.75rem;color:{COLORS["text_muted"]}">Matures: {p["maturity_date"]}</span>'
 
-                note_html = f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:4px;font-style:italic">{p["note"]}</div>' if p["note"] else ""
+                note_html = f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:4px;font-style:italic">{_esc(p["note"])}</div>' if p["note"] else ""
 
                 st.markdown(
                     f'<div style="background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:14px;'
@@ -5841,11 +5874,11 @@ elif page == "Policies":
                     f'<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">'
                     f'<div>'
                     f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
-                    f'<span style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{p["name"]}</span>'
-                    f'<span style="background:{tc}15;color:{tc};padding:2px 10px;border-radius:10px;font-size:0.72rem;font-weight:700">{p["policy_type"]}</span>'
+                    f'<span style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{_esc(p["name"])}</span>'
+                    f'<span style="background:{tc}15;color:{tc};padding:2px 10px;border-radius:10px;font-size:0.72rem;font-weight:700">{_esc(p["policy_type"])}</span>'
                     f'</div>'
                     f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]};margin-top:2px">'
-                    f'{p["provider"]} {" | #" + p["policy_number"] if p["policy_number"] else ""}</div>'
+                    f'{_esc(p["provider"])} {" | #" + _esc(p["policy_number"]) if p["policy_number"] else ""}</div>'
                     f'</div>'
                     f'<div style="text-align:right">'
                     f'<div style="font-size:1.15rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(p["current_value"])}</div>'
@@ -5855,7 +5888,7 @@ elif page == "Policies":
                     f'<div style="display:flex;gap:24px;flex-wrap:wrap;font-size:0.82rem;padding-top:8px;border-top:1px solid {COLORS["card_border"]}">'
                     f'<div><span style="color:{COLORS["text_muted"]}">Premium:</span> '
                     f'<span style="font-weight:600;color:{COLORS["text"]}">{fmt_inr(p["premium_amount"])}</span>'
-                    f'<span style="color:{COLORS["text_muted"]}"> / {p["premium_frequency"]}</span></div>'
+                    f'<span style="color:{COLORS["text_muted"]}"> / {_esc(p["premium_frequency"])}</span></div>'
                     f'<div><span style="color:{COLORS["text_muted"]}">Total Paid:</span> '
                     f'<span style="font-weight:600;color:{COLORS["text"]}">{fmt_inr(p["total_premiums_paid"])}</span></div>'
                     f'<div><span style="color:{COLORS["text_muted"]}">Sum Assured:</span> '
@@ -6048,16 +6081,16 @@ elif page == "Lent Out":
 
             loan_rows += f"""
             <tr>
-                <td style="font-weight:500;color:{COLORS['text']}">{l['borrower']}</td>
+                <td style="font-weight:500;color:{COLORS['text']}">{_esc(l['borrower'])}</td>
                 <td class="amount">{fmt_inr_full(l['original_amount'])}</td>
                 <td class="amount" style="font-weight:600;color:{COLORS['danger'] if l['outstanding'] > 0 else COLORS['success']}">{fmt_inr_full(l['outstanding'])}</td>
                 <td class="amount" style="color:{COLORS['success']}">{fmt_inr_full(recovered)}</td>
                 <td>{progress_bar}</td>
                 <td style="text-align:center"><span style="background:{s_bg};color:{s_fg};
-                    padding:2px 10px;border-radius:10px;font-size:0.8rem;font-weight:600">{l['status']}</span></td>
+                    padding:2px 10px;border-radius:10px;font-size:0.8rem;font-weight:600">{_esc(l['status'])}</span></td>
                 <td style="font-size:0.85rem;color:{COLORS['text_muted']}">{l['lent_date']}</td>
                 <td style="font-size:0.85rem">{l['expected_return_date'] or '--'}{overdue_tag}</td>
-                <td style="font-size:0.85rem;color:{COLORS['text_muted']}">{l['note'] or '--'}</td>
+                <td style="font-size:0.85rem;color:{COLORS['text_muted']}">{_esc(l['note'] or '--')}</td>
             </tr>"""
 
         st.markdown(f"""
@@ -6087,7 +6120,7 @@ elif page == "Lent Out":
         if overdue_loans:
             overdue_total = sum(o[1] for o in overdue_loans)
             insights.append(f"<span style='color:{COLORS['danger']}'><strong>{len(overdue_loans)} overdue loan(s)</strong> totalling {fmt_inr_full(overdue_total)}: "
-                          + ", ".join(f"{o[0]} ({o[2]} days)" for o in sorted(overdue_loans, key=lambda x: x[2], reverse=True)) + "</span>")
+                          + ", ".join(f"{_esc(o[0])} ({o[2]} days)" for o in sorted(overdue_loans, key=lambda x: x[2], reverse=True)) + "</span>")
         elif active_count > 0:
             insights.append(f"<span style='color:{COLORS['success']}'>No overdue loans — all {active_count} active loans are within expected return dates.</span>")
         # Largest outstanding
@@ -6095,7 +6128,7 @@ elif page == "Lent Out":
             active_list = [(l["borrower"], l["outstanding"]) for l in loans if l["status"] in ("Active", "Partially Paid")]
             if active_list:
                 largest = max(active_list, key=lambda x: x[1])
-                insights.append(f"Largest outstanding: <strong>{largest[0]}</strong> with {fmt_inr_full(largest[1])} ({largest[1]/total_outstanding*100:.0f}% of receivables).")
+                insights.append(f"Largest outstanding: <strong>{_esc(largest[0])}</strong> with {fmt_inr_full(largest[1])} ({largest[1]/total_outstanding*100:.0f}% of receivables).")
         # Net worth context
         if total_outstanding > 0:
             all_src = db.get_sources()
@@ -6120,7 +6153,7 @@ elif page == "Lent Out":
                     <tr>
                         <td>{pay['payment_date']}</td>
                         <td class="amount" style="color:{COLORS['success']};font-weight:500">{fmt_inr_full(pay['amount'])}</td>
-                        <td style="color:{COLORS['text_muted']}">{pay['note'] or '--'}</td>
+                        <td style="color:{COLORS['text_muted']}">{_esc(pay['note'] or '--')}</td>
                     </tr>"""
                 st.markdown(f"""
                 <table class="styled-table">
@@ -6416,11 +6449,11 @@ elif page == "Gold Schemes":
                         f' fill="{COLORS["text"]}" font-family="Inter,sans-serif">{s["months_paid"]}</text>'
                         f'</svg>'
                         f'<div>'
-                        f'<div style="font-size:1.05rem;font-weight:700;color:{COLORS["text"]};line-height:1.2">{s["jeweller"]}</div>'
+                        f'<div style="font-size:1.05rem;font-weight:700;color:{COLORS["text"]};line-height:1.2">{_esc(s["jeweller"])}</div>'
                         f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]}">{start_str} &rarr; {end_str} {days_left_str}</div>'
                         f'</div></div>'
                         f'<span style="background:{s_bg};color:{s_fg};padding:3px 12px;border-radius:20px;'
-                        f'font-size:0.72rem;font-weight:700;letter-spacing:0.03em">{s["status"]}</span>'
+                        f'font-size:0.72rem;font-weight:700;letter-spacing:0.03em">{_esc(s["status"])}</span>'
                         f'</div>'
                         f'<div style="margin-bottom:16px">'
                         f'<div style="display:flex;justify-content:space-between;margin-bottom:5px">'
@@ -6512,8 +6545,8 @@ elif page == "Gold Schemes":
                                 display:flex;align-items:center;justify-content:center;flex-shrink:0;
                                 font-size:0.75rem;font-weight:800;color:{COLORS['gold']}">{p['month']}</div>
                             <div style="flex:1;min-width:0">
-                                <div style="font-size:0.85rem;font-weight:600;color:{COLORS['text']}">{p['jeweller']}</div>
-                                <div style="font-size:0.72rem;color:{COLORS['text_muted']}">{p['date']}{(' — ' + p['note']) if p['note'] else ''}</div>
+                                <div style="font-size:0.85rem;font-weight:600;color:{COLORS['text']}">{_esc(p['jeweller'])}</div>
+                                <div style="font-size:0.72rem;color:{COLORS['text_muted']}">{p['date']}{(' — ' + _esc(p['note'])) if p['note'] else ''}</div>
                             </div>
                             <div style="font-size:0.92rem;font-weight:700;color:{COLORS['success']};white-space:nowrap">{fmt_inr_full(p['amount'])}</div>
                         </div>
@@ -6573,7 +6606,7 @@ elif page == "Gold Schemes":
             # Nearing completion
             near_complete = [s for s in schemes if s["status"] == "Active" and s["months_paid"] >= s["total_months"] - 2 and s["months_paid"] < s["total_months"]]
             if near_complete:
-                names = ", ".join(f"<strong>{s['jeweller']}</strong> ({s['months_paid']}/{s['total_months']})" for s in near_complete)
+                names = ", ".join(f"<strong>{_esc(s['jeweller'])}</strong> ({s['months_paid']}/{s['total_months']})" for s in near_complete)
                 insights.append(f"<span style='color:{COLORS['gold']}'>Nearing maturity: {names} — start planning your gold purchase!</span>")
             # Missed payment detection
             for s in active_schemes:
@@ -6583,7 +6616,7 @@ elif page == "Gold Schemes":
                         expected_months = max(0, (date.today().year - start_d.year) * 12 + date.today().month - start_d.month)
                         if expected_months > s["months_paid"] + 1:
                             gap = expected_months - s["months_paid"]
-                            insights.append(f"<span style='color:{COLORS['danger']}'><strong>{s['jeweller']}</strong>: {gap} payment(s) may be overdue (started {start_d.strftime('%b %Y')}, expected ~{expected_months} months, paid {s['months_paid']}).</span>")
+                            insights.append(f"<span style='color:{COLORS['danger']}'><strong>{_esc(s['jeweller'])}</strong>: {gap} payment(s) may be overdue (started {start_d.strftime('%b %Y')}, expected ~{expected_months} months, paid {s['months_paid']}).</span>")
                     except ValueError:
                         pass
             # Net worth context
@@ -6628,7 +6661,7 @@ elif page == "Gold Schemes":
             <div style="background:{COLORS['card']};border:1px solid {COLORS['card_border']};border-radius:14px;
                 padding:20px;margin:10px 0 18px 0;box-shadow:{COLORS['card_shadow']};border-left:4px solid {COLORS['gold_accent']}">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-                    <span style="font-size:1.05rem;font-weight:700;color:{COLORS['text']}">{sel_s['jeweller']}</span>
+                    <span style="font-size:1.05rem;font-weight:700;color:{COLORS['text']}">{_esc(sel_s['jeweller'])}</span>
                     <span style="font-size:0.85rem;font-weight:600;color:{COLORS['gold']}">Month {sel_s['months_paid'] + 1} of {sel_s['total_months']}</span>
                 </div>
                 <div style="display:flex;gap:24px;margin-bottom:14px;flex-wrap:wrap">
@@ -6728,7 +6761,7 @@ elif page == "Gold Schemes":
                                     font-size:0.82rem;font-weight:800;color:white">{pay['month_number'] or '?'}</div>
                                 <div style="flex:1">
                                     <div style="font-size:0.85rem;font-weight:600;color:{COLORS['text']}">{pay['payment_date']}</div>
-                                    <div style="font-size:0.72rem;color:{COLORS['text_muted']}">{pay['note'] or 'No note'}</div>
+                                    <div style="font-size:0.72rem;color:{COLORS['text_muted']}">{_esc(pay['note'] or 'No note')}</div>
                                 </div>
                                 <div style="font-size:0.95rem;font-weight:700;color:{COLORS['success']}">{fmt_inr_full(pay['amount'])}</div>
                             </div>
