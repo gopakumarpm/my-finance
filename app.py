@@ -3795,11 +3795,17 @@ elif page == "Gold Portfolio":
         with fc[3]:
             gp_carat = st.selectbox("Purity", ["22K", "24K", "18K"], key=f"gpp_ct_{gpv}")
 
+        # Auto-update price when weight or purity changes
         auto_price = round(gp_weight * rate_map.get(gp_carat, r22), 2) if latest_rate and gp_weight > 0 else 0.0
+        _prev_key = f"_gpp_prev_{gpv}"
+        _cur = (gp_weight, gp_carat)
+        if st.session_state.get(_prev_key) != _cur:
+            st.session_state[f"gpp_pr_{gpv}"] = auto_price
+            st.session_state[_prev_key] = _cur
         fc2 = st.columns([1, 1, 1, 2])
         with fc2[0]:
             gp_price = st.number_input("Total Price (Rs.) *", min_value=0.0, step=100.0, format="%.2f",
-                                       value=auto_price, key=f"gpp_pr_{gpv}")
+                                       key=f"gpp_pr_{gpv}")
         with fc2[1]:
             gp_date = st.date_input("Purchase Date", value=date.today(), key=f"gpp_dt_{gpv}")
         with fc2[2]:
@@ -3983,9 +3989,13 @@ elif page == "Gold Portfolio":
         with dc[0]:
             dg_weight = st.number_input("Weight (g) *", min_value=0.001, step=0.01, format="%.4f", key=f"dgp_wt_{gdv}")
         dg_auto_price = round(dg_weight * r24, 2) if latest_rate and dg_weight > 0 else 0.0
+        _dg_prev_key = f"_dgp_prev_{gdv}"
+        if st.session_state.get(_dg_prev_key) != dg_weight:
+            st.session_state[f"dgp_pr_{gdv}"] = dg_auto_price
+            st.session_state[_dg_prev_key] = dg_weight
         with dc[1]:
             dg_price = st.number_input("Purchase Price (Rs.) *", min_value=0.0, step=100.0, format="%.2f",
-                                       value=dg_auto_price, key=f"dgp_pr_{gdv}")
+                                       key=f"dgp_pr_{gdv}")
         with dc[2]:
             dg_date = st.date_input("Purchase Date", value=date.today(), key=f"dgp_dt_{gdv}")
         with dc[3]:
