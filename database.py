@@ -4,7 +4,7 @@ Drop-in replacement for the SQLite version. All function signatures
 are identical so app.py requires zero changes.
 """
 
-import os
+import os, time
 from datetime import date
 from supabase import create_client, Client
 
@@ -97,14 +97,21 @@ def deactivate_source(source_id):
 
 # ======================== BALANCES ========================
 
-def get_latest_balance(source_id):
-    resp = (_sb().table("balance_updates").select("balance")
-            .eq("source_id", source_id)
-            .order("update_date", desc=True).order("id", desc=True)
-            .limit(1).execute())
-    if resp.data:
-        return resp.data[0]["balance"]
-    return 0.0
+def get_latest_balance(source_id, _retries=2):
+    for attempt in range(_retries + 1):
+        try:
+            resp = (_sb().table("balance_updates").select("balance")
+                    .eq("source_id", source_id)
+                    .order("update_date", desc=True).order("id", desc=True)
+                    .limit(1).execute())
+            if resp.data:
+                return resp.data[0]["balance"]
+            return 0.0
+        except Exception:
+            if attempt < _retries:
+                time.sleep(0.5)
+            else:
+                return 0.0
 
 
 def update_balance(source_id, new_balance, note="", update_date=None):

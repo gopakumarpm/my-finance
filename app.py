@@ -3550,6 +3550,18 @@ elif page == "Gold Portfolio":
     page_title("Gold Portfolio", "Physical gold, digital gold & scheme investments — all in one place")
 
     latest_rate = db.get_latest_gold_rate()
+
+    # Auto-fetch today's gold rate if stale (not from today)
+    rate_is_stale = (not latest_rate) or (latest_rate.get("rate_date") != date.today().isoformat())
+    if rate_is_stale:
+        try:
+            rate_data = gr.fetch_gold_rate_pune()
+            if rate_data:
+                db.save_gold_rate(rate_data["rate_22k"], rate_data["rate_24k"], rate_data["date"])
+                latest_rate = db.get_latest_gold_rate()
+        except Exception:
+            pass
+
     purchases = db.get_gold_purchases()
     schemes = db.get_gold_schemes()
 
@@ -3741,7 +3753,10 @@ elif page == "Gold Portfolio":
             monthly_sch = sum(s["monthly_amount"] for s in active_schemes)
             insights.append(f"Active schemes: <strong>{len(active_schemes)}</strong>, monthly commitment: <strong>{fmt_inr_full(monthly_sch)}</strong>.")
         all_src = db.get_sources()
-        nw = sum(db.get_latest_balance(src["id"]) for src in all_src)
+        try:
+            nw = sum(db.get_latest_balance(src["id"]) for src in all_src)
+        except Exception:
+            nw = 0
         if nw > 0:
             gold_nw_pct = (total_gold_market if latest_rate else total_gold_invested) / nw * 100
             insights.append(f"Gold represents <strong>{gold_nw_pct:.1f}%</strong> of your total net worth.")
@@ -3809,6 +3824,34 @@ elif page == "Gold Portfolio":
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
             section_header(f"Physical Holdings ({len(phys_purchases)} items, {phys_weight:.2f}g)", "&#x1f48e;")
 
+            # Vault Summary Card
+            phys_gain = phys_market - phys_invested if latest_rate else 0
+            phys_gain_pct = (phys_gain / phys_invested * 100) if phys_invested > 0 and latest_rate else 0
+            pg_color = COLORS["success"] if phys_gain >= 0 else COLORS["danger"]
+            pg_sign = "+" if phys_gain >= 0 else ""
+            vault_val = phys_market if latest_rate else phys_invested
+            st.markdown(
+                f'<div style="background:linear-gradient(135deg,{G["cream"]},{G["glow"]});border:1px solid {G["accent"]}30;'
+                f'border-radius:14px;padding:16px 20px;margin-bottom:14px;display:flex;justify-content:space-between;'
+                f'align-items:center;flex-wrap:wrap;gap:12px">'
+                f'<div style="display:flex;gap:28px;flex-wrap:wrap">'
+                f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Current Value</div>'
+                f'<div style="font-size:1.3rem;font-weight:900;color:{G["dark"]}">{fmt_inr(vault_val)}</div></div>'
+                f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Total Invested</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{COLORS["text"]}">{fmt_inr(phys_invested)}</div></div>'
+                f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Total Weight</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{COLORS["text"]}">{phys_weight:.2f}g</div></div>'
+                + (f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Gain / Loss</div>'
+                   f'<div style="font-size:1.1rem;font-weight:800;color:{pg_color}">{pg_sign}{fmt_inr(phys_gain)} ({phys_gain_pct:+.1f}%)</div></div>'
+                   if latest_rate else '')
+                + f'</div>'
+                f'<div style="text-align:right">'
+                f'<div style="font-size:0.6rem;color:{COLORS["text_muted"]}">Rate as of {rate_date_str}</div>'
+                + (f'<div style="font-size:0.75rem;color:{G["warm"]};font-weight:600">22K: Rs. {r22:,.0f}/g &middot; 24K: Rs. {r24:,.0f}/g</div>'
+                   if latest_rate else '')
+                + f'</div></div>',
+                unsafe_allow_html=True)
+
             editing_gp_id = st.session_state.get("gp_editing_id")
 
             for p in phys_purchases:
@@ -3855,13 +3898,26 @@ elif page == "Gold Portfolio":
                 else:
                     card_cols = st.columns([12, 1, 1])
                     with card_cols[0]:
-                        mkt_html = f"Mkt: {fmt_inr(market_val)}" if latest_rate else ""
-                        var_html = (f'<span style="color:{gc};font-weight:700;margin-left:8px">'
-                                    f'{"+" if gain_item>=0 else ""}{fmt_inr(gain_item)} ({gain_pct_item:+.1f}%)</span>') if latest_rate else ""
+                        gain_sign = "+" if gain_item >= 0 else ""
+                        # Right side: two-row display — current value on top, buy price + variance below
+                        if latest_rate:
+                            value_html = (
+                                f'<div style="text-align:right;min-width:200px">'
+                                f'<div style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(market_val)}</div>'
+                                f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-top:2px">'
+                                f'Bought: {fmt_inr(p["total_purchase_price"])}</div>'
+                                f'<div style="font-size:0.78rem;font-weight:700;color:{gc};margin-top:1px">'
+                                f'{gain_sign}{fmt_inr(gain_item)} ({gain_pct_item:+.1f}%)</div>'
+                                f'</div>')
+                        else:
+                            value_html = (
+                                f'<div style="text-align:right;min-width:160px">'
+                                f'<div style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(p["total_purchase_price"])}</div>'
+                                f'</div>')
                         st.markdown(
                             f'<div style="display:flex;align-items:center;gap:14px;padding:12px 16px;margin-bottom:5px;'
                             f'background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:12px;'
-                            f'box-shadow:{COLORS["card_shadow"]};border-left:3px solid {G["accent"]}">'
+                            f'box-shadow:{COLORS["card_shadow"]};border-left:3px solid {gc if latest_rate else G["accent"]}">'
                             f'<div style="min-width:44px;text-align:center">'
                             f'<span style="background:{G["cream"]};color:{G["warm"]};padding:3px 10px;'
                             f'border-radius:10px;font-size:0.78rem;font-weight:700">{_esc(p["carat"])}</span></div>'
@@ -3869,12 +3925,11 @@ elif page == "Gold Portfolio":
                             f'<div style="font-size:0.92rem;font-weight:700;color:{COLORS["text"]}">{_esc(p["description"])}'
                             f'<span style="font-weight:400;color:{COLORS["text_muted"]};font-size:0.78rem;margin-left:8px">{_esc(p["seller"] or "")}</span></div>'
                             f'<div style="font-size:0.75rem;color:{COLORS["text_muted"]};margin-top:2px">'
-                            f'{p["weight_grams"]:.3f}g &middot; Buy: Rs. {buy_ppg:,.0f}/g &middot; {p["purchase_date"]}'
+                            f'{p["weight_grams"]:.3f}g &middot; Buy: Rs. {buy_ppg:,.0f}/g'
+                            + (f' &middot; Now: Rs. {curr_rate:,.0f}/g' if latest_rate else '')
+                            + f' &middot; {p["purchase_date"]}'
                             f'{" &middot; " + _esc(p["note"]) if p["note"] else ""}</div></div>'
-                            f'<div style="text-align:right;min-width:160px">'
-                            f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">Buy: {fmt_inr(p["total_purchase_price"])}</div>'
-                            f'<div style="font-size:0.78rem;color:{COLORS["text_muted"]};margin-top:1px">{mkt_html}{var_html}</div>'
-                            f'</div></div>',
+                            f'{value_html}</div>',
                             unsafe_allow_html=True)
                     with card_cols[1]:
                         if st.button("\u270f\ufe0f", key=f"gp_edit_{pid}", help="Edit"):
@@ -3946,6 +4001,34 @@ elif page == "Gold Portfolio":
             st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
             section_header(f"Digital Gold Holdings ({digi_weight:.4f}g, {len(digi_purchases)} transactions)", "&#x1f4f1;")
 
+            # Digital Vault Summary
+            digi_gain = digi_market - digi_invested if latest_rate else 0
+            digi_gain_pct = (digi_gain / digi_invested * 100) if digi_invested > 0 and latest_rate else 0
+            dg_color = COLORS["success"] if digi_gain >= 0 else COLORS["danger"]
+            dg_sign = "+" if digi_gain >= 0 else ""
+            digi_val = digi_market if latest_rate else digi_invested
+            st.markdown(
+                f'<div style="background:linear-gradient(135deg,#EBF5FF,#DBEAFE);border:1px solid #3B82F630;'
+                f'border-radius:14px;padding:16px 20px;margin-bottom:14px;display:flex;justify-content:space-between;'
+                f'align-items:center;flex-wrap:wrap;gap:12px">'
+                f'<div style="display:flex;gap:28px;flex-wrap:wrap">'
+                f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Current Value</div>'
+                f'<div style="font-size:1.3rem;font-weight:900;color:#1E3A5F">{fmt_inr(digi_val)}</div></div>'
+                f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Total Invested</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{COLORS["text"]}">{fmt_inr(digi_invested)}</div></div>'
+                f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Total Weight</div>'
+                f'<div style="font-size:1.1rem;font-weight:700;color:{COLORS["text"]}">{digi_weight:.4f}g</div></div>'
+                + (f'<div><div style="font-size:0.65rem;font-weight:600;text-transform:uppercase;color:{COLORS["text_muted"]}">Gain / Loss</div>'
+                   f'<div style="font-size:1.1rem;font-weight:800;color:{dg_color}">{dg_sign}{fmt_inr(digi_gain)} ({digi_gain_pct:+.1f}%)</div></div>'
+                   if latest_rate else '')
+                + f'</div>'
+                f'<div style="text-align:right">'
+                f'<div style="font-size:0.6rem;color:{COLORS["text_muted"]}">Rate as of {rate_date_str}</div>'
+                + (f'<div style="font-size:0.75rem;color:#2563EB;font-weight:600">24K: Rs. {r24:,.0f}/g</div>'
+                   if latest_rate else '')
+                + f'</div></div>',
+                unsafe_allow_html=True)
+
             editing_dg_id = st.session_state.get("dg_editing_id")
 
             for p in digi_purchases:
@@ -3982,21 +4065,33 @@ elif page == "Gold Portfolio":
                 else:
                     dc2 = st.columns([12, 1, 1])
                     with dc2[0]:
-                        mkt_html = f"Mkt: {fmt_inr(market_val)}" if latest_rate else ""
-                        var_html = (f'<span style="color:{gc};font-weight:700;margin-left:8px">'
-                                    f'{"+" if gain_item>=0 else ""}{fmt_inr(gain_item)} ({gp_item:+.1f}%)</span>') if latest_rate else ""
+                        dg_gain_sign = "+" if gain_item >= 0 else ""
+                        if latest_rate:
+                            dg_val_html = (
+                                f'<div style="text-align:right;min-width:190px">'
+                                f'<div style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(market_val)}</div>'
+                                f'<div style="font-size:0.72rem;color:{COLORS["text_muted"]};margin-top:2px">'
+                                f'Bought: {fmt_inr(p["total_purchase_price"])}</div>'
+                                f'<div style="font-size:0.78rem;font-weight:700;color:{gc};margin-top:1px">'
+                                f'{dg_gain_sign}{fmt_inr(gain_item)} ({gp_item:+.1f}%)</div>'
+                                f'</div>')
+                        else:
+                            dg_val_html = (
+                                f'<div style="text-align:right;min-width:150px">'
+                                f'<div style="font-size:1rem;font-weight:800;color:{COLORS["text"]}">{fmt_inr(p["total_purchase_price"])}</div>'
+                                f'</div>')
                         st.markdown(
                             f'<div style="display:flex;align-items:center;gap:14px;padding:10px 16px;margin-bottom:4px;'
                             f'background:{COLORS["card"]};border:1px solid {COLORS["card_border"]};border-radius:10px;'
-                            f'border-left:3px solid #2563EB">'
+                            f'border-left:3px solid {gc if latest_rate else "#2563EB"}">'
                             f'<div style="flex:1">'
                             f'<div style="font-size:0.88rem;font-weight:700;color:{COLORS["text"]}">{p["weight_grams"]:.4f}g'
                             f'<span style="font-size:0.75rem;font-weight:400;color:{COLORS["text_muted"]};margin-left:8px">'
-                            f'24K &middot; Buy: Rs. {p["purchase_price_per_gram"]:,.0f}/g &middot; {p["purchase_date"]}'
+                            f'24K &middot; Buy: Rs. {p["purchase_price_per_gram"]:,.0f}/g'
+                            + (f' &middot; Now: Rs. {curr_rate:,.0f}/g' if latest_rate else '')
+                            + f' &middot; {p["purchase_date"]}'
                             f'{" &middot; " + _esc(p["note"]) if p["note"] else ""}</span></div></div>'
-                            f'<div style="text-align:right;min-width:150px">'
-                            f'<div style="font-size:0.85rem;font-weight:700;color:{COLORS["text"]}">Buy: {fmt_inr(p["total_purchase_price"])}</div>'
-                            f'<div style="font-size:0.75rem">{mkt_html}{var_html}</div></div></div>',
+                            f'{dg_val_html}</div>',
                             unsafe_allow_html=True)
                     with dc2[1]:
                         if st.button("\u270f\ufe0f", key=f"dg_edit_{pid}", help="Edit"):
