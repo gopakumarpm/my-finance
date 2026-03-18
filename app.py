@@ -2354,7 +2354,7 @@ elif page == "Bank Update":
                 f'</div></div></div>',
                 unsafe_allow_html=True)
 
-            new_balance = st.number_input("New Balance (Rs.)", value=current, step=100.0, format="%.2f", key="bk_new_bal")
+            new_balance = st.number_input("New Balance (Rs.)", value=float(current), step=100.0, format="%.2f", key="bk_new_bal")
             update_date = st.date_input("Date of update", value=date.today(), key="bk_update_date")
             note = st.text_input("Note (optional)", placeholder="e.g., Salary credited, EMI debited", key="bk_note")
 
